@@ -1,0 +1,334 @@
+#include <Bluepad32.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// ===================== PINS =====================
+const int LED_PIN = 25;
+
+const int rightMotorPin1 = 33;
+const int rightMotorPin2 = 32;
+const int leftMotorPin1  = 27;
+const int leftMotorPin2  = 26;
+
+// ===================== PWM =====================
+#define CH_R1 0
+#define CH_R2 1
+#define CH_L1 2
+#define CH_L2 3
+
+// ===================== SERVO DRIVER =====================
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+
+// ===================== SERVO GLOBAL PULSE LIMITS =====================
+const int SERVO_ABS_MIN_PULSE = 150;
+const int SERVO_ABS_MAX_PULSE = 670;
+
+int angleToPulseGlobal(int angle) {
+  angle = constrain(angle, 0, 180);
+  return map(angle, 0, 180, SERVO_ABS_MIN_PULSE, SERVO_ABS_MAX_PULSE);
+}
+
+// ===================== SERVO LIMITS =====================
+struct ServoLimit {
+  int minPulse;
+  int maxPulse;
+};
+
+ServoLimit servoLimit[7] = {
+  { angleToPulseGlobal(0),  angleToPulseGlobal(60)  },   // CH0: 0 → 60
+  { angleToPulseGlobal(60), angleToPulseGlobal(120) },   // CH1: 60 → 120
+  { angleToPulseGlobal(30), angleToPulseGlobal(150) },   // CH2
+  { angleToPulseGlobal(10), angleToPulseGlobal(180) },   // CH3
+  { angleToPulseGlobal(30), angleToPulseGlobal(180) },   // CH4
+  { angleToPulseGlobal(40), angleToPulseGlobal(140) },   // CH5
+  { angleToPulseGlobal(40), angleToPulseGlobal(140) }    // CH6
+};
+
+// ===================== SERVO POSITIONS =====================
+int servoDeg[7];
+int lastServoDeg[7];
+
+// ===================== SPEED GROUPS =====================
+int speedEyes   = 5;   // CH0, CH1
+int speedHead   = 5;   // CH2
+int speedNeck   = 5;   // CH3, CH4
+int speedArms   = 5;   // CH5, CH6
+
+// ===================== INTERNAL SPEED SCALING =====================
+float pulsePerDeg[7];
+const float TARGET_PULSE_SPEED = 4.0;
+
+// ===================== MOTOR LIMIT =====================
+const int MAX_PWM = 242;
+
+// ===================== LED TOGGLE =====================
+bool ledState = false;
+bool lastBState = false;
+
+// ===================== CONTROLLER STORAGE =====================
+ControllerPtr myControllers[BP32_MAX_GAMEPADS];
+unsigned long controllerConnectedAt = 0;
+
+bool homingDone = false;
+
+// ===================== MOTOR =====================
+void stopMotors() {
+  ledcWrite(CH_R1, 0);
+  ledcWrite(CH_R2, 0);
+  ledcWrite(CH_L1, 0);
+  ledcWrite(CH_L2, 0);
+}
+
+// ===================== DEGREE → PULSE =====================
+int angleToPulse(int ch, int angle) {
+  angle = constrain(angle, 0, 180);
+  return map(angle, 0, 180, servoLimit[ch].minPulse, servoLimit[ch].maxPulse);
+}
+
+// ===================== SPEED SCALING FUNCTION =====================
+int scaledStep(int ch, int logicalStep) {
+    float pulseStep = logicalStep * TARGET_PULSE_SPEED;
+    float scaledDeg = pulseStep / pulsePerDeg[ch];
+
+    if (scaledDeg > 0 && scaledDeg < 1) scaledDeg = 1;
+    if (scaledDeg < 0 && scaledDeg > -1) scaledDeg = -1;
+
+    return (int)scaledDeg;
+}
+
+// ===================== UPDATED HOMING FUNCTION =====================
+void homeServos() {
+  for (int ch = 0; ch < 7; ch++) {
+
+    if (ch == 0) {
+      int startPulse = angleToPulse(ch, 0);
+      int targetPulse = angleToPulse(ch, 60);
+
+      for (int p = startPulse; p <= targetPulse; p += 2) {
+        pwm.setPWM(ch, 0, p);
+        delay(5);
+      }
+
+      servoDeg[ch] = 60;
+      lastServoDeg[ch] = 60;
+      continue;
+    }
+
+    if (ch == 1) {
+      int startPulse = angleToPulse(ch, 120);
+      int targetPulse = angleToPulse(ch, 60);
+
+      for (int p = startPulse; p >= targetPulse; p -= 2) {
+        pwm.setPWM(ch, 0, p);
+        delay(5);
+      }
+
+      servoDeg[ch] = 60;
+      lastServoDeg[ch] = 60;
+      continue;
+    }
+
+    int startPulse = angleToPulse(ch, 90);
+    int targetPulse;
+
+    if (ch == 2) {
+      targetPulse = (servoLimit[ch].minPulse + servoLimit[ch].maxPulse) / 2;
+    }
+    else if (ch == 4) {
+      targetPulse = servoLimit[ch].minPulse;   // CH4 reversed
+    }
+    else if (ch == 6) {
+      targetPulse = servoLimit[ch].maxPulse;
+    }
+    else {
+      targetPulse = servoLimit[ch].minPulse;
+    }
+
+    int step = (startPulse > targetPulse) ? -2 : 2;
+
+    for (int p = startPulse; (step < 0 ? p >= targetPulse : p <= targetPulse); p += step) {
+      pwm.setPWM(ch, 0, p);
+      delay(5);
+    }
+
+    int targetAngle = map(
+      targetPulse,
+      servoLimit[ch].minPulse,
+      servoLimit[ch].maxPulse,
+      0,
+      180
+    );
+
+    servoDeg[ch] = targetAngle;
+    lastServoDeg[ch] = targetAngle;
+  }
+}
+
+// ===================== GAMEPAD =====================
+void processGamepad(ControllerPtr ctl) {
+
+  if (millis() - controllerConnectedAt < 500) return;
+
+  bool btnB = ctl->buttons() & 0x0002;
+  if (btnB && !lastBState) {
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
+  }
+  lastBState = btnB;
+
+  int leftTrigger  = ctl->throttle();
+  int rightTrigger = ctl->brake();
+
+  int motorA_speed = map(leftTrigger, 0, 1023, 0, MAX_PWM);
+  int motorB_speed = map(rightTrigger, 0, 1023, 0, MAX_PWM);
+
+  if (motorA_speed > 0) motorA_speed += 20;
+  if (motorB_speed > 0) motorB_speed += 20;
+
+  motorA_speed = constrain(motorA_speed, 0, MAX_PWM);
+  motorB_speed = constrain(motorB_speed, 0, MAX_PWM);
+
+  ledcWrite(CH_R1, motorA_speed);
+  ledcWrite(CH_R2, 0);
+  ledcWrite(CH_L1, motorB_speed);
+  ledcWrite(CH_L2, 0);
+
+  bool lb = ctl->buttons() & 0x0010;
+  bool rb = ctl->buttons() & 0x0020;
+
+  bool anyBumper = lb || rb;
+
+  // ===================== EYES (CH0–CH1) =====================
+
+  if (rb) {
+      servoDeg[0] -= (scaledStep(0, speedEyes) + 10);
+  }
+
+  if (lb) {
+      servoDeg[1] += (scaledStep(1, speedEyes) + 10);
+  }
+
+  servoDeg[0] = constrain(servoDeg[0], 0, 60);
+  servoDeg[1] = constrain(servoDeg[1], 60, 120);
+
+  if (!anyBumper) {
+
+      if (servoDeg[0] < 60)
+          servoDeg[0] += scaledStep(0, speedEyes);
+      else if (servoDeg[0] > 60)
+          servoDeg[0] -= scaledStep(0, speedEyes);
+
+      if (servoDeg[1] < 60)
+          servoDeg[1] += scaledStep(1, speedEyes);
+      else if (servoDeg[1] > 60)
+          servoDeg[1] -= scaledStep(1, speedEyes);
+
+      servoDeg[0] = constrain(servoDeg[0], 0, 60);
+      servoDeg[1] = constrain(servoDeg[1], 60, 120);
+  }
+
+  // ===================== OTHER SERVOS =====================
+  int leftX  = ctl->axisX();
+  int leftY  = ctl->axisY();
+  int rightY = ctl->axisRY();
+
+  const int DEADZONE = 100;
+
+  if (abs(leftX) > DEADZONE)
+      servoDeg[2] += scaledStep(2, (leftX > 0 ? -speedHead : speedHead));
+
+  if (abs(leftY) > DEADZONE)
+      servoDeg[3] += scaledStep(3, (leftY > 0 ? -speedNeck : speedNeck));
+
+  // ===================== CH4 FLIPPED =====================
+  if (abs(rightY) > DEADZONE)
+      servoDeg[4] += scaledStep(4, (rightY > 0 ? -speedNeck : speedNeck));
+
+  int dpad = ctl->dpad();
+
+  if (dpad == 0x01) servoDeg[5] += scaledStep(5, speedArms);
+  if (dpad == 0x02) servoDeg[5] -= scaledStep(5, speedArms);
+
+  bool btnY = ctl->buttons() & 0x0008;
+  bool btnA = ctl->buttons() & 0x0001;
+
+  if (btnA) servoDeg[6] += scaledStep(6, speedArms);
+  if (btnY) servoDeg[6] -= scaledStep(6, speedArms);
+
+  // ===================== APPLY SERVO MOVEMENT =====================
+  for (int ch = 0; ch < 7; ch++) {
+    servoDeg[ch] = constrain(servoDeg[ch], 0, 180);
+
+    if (servoDeg[ch] != lastServoDeg[ch]) {
+      pwm.setPWM(ch, 0, angleToPulse(ch, servoDeg[ch]));
+      lastServoDeg[ch] = servoDeg[ch];
+    }
+  }
+}
+
+// ===================== CONTROLLER EVENTS =====================
+void onConnectedController(ControllerPtr ctl) {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (!myControllers[i]) {
+      myControllers[i] = ctl;
+      controllerConnectedAt = millis();
+      break;
+    }
+  }
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] == ctl) myControllers[i] = nullptr;
+  }
+  digitalWrite(LED_PIN, LOW);
+  ledState = false;
+}
+
+// ===================== PROCESS =====================
+void processControllers() {
+  for (auto ctl : myControllers) {
+    if (ctl && ctl->isConnected() && ctl->hasData()) processGamepad(ctl);
+  }
+}
+
+// ===================== SETUP =====================
+void setup() {
+  Serial.begin(115115);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  ledcSetup(CH_R1, 1000, 8);
+  ledcSetup(CH_R2, 1000, 8);
+  ledcSetup(CH_L1, 1000, 8);
+  ledcSetup(CH_L2, 1000, 8);
+
+  ledcAttachPin(rightMotorPin1, CH_R1);
+  ledcAttachPin(rightMotorPin2, CH_R2);
+  ledcAttachPin(leftMotorPin1, CH_L1);
+  ledcAttachPin(leftMotorPin2, CH_L2);
+
+  stopMotors();
+
+  pwm.begin();
+  pwm.setPWMFreq(60);
+
+  delay(200);
+
+  homeServos();
+  homingDone = true;
+
+  for (int ch = 0; ch < 7; ch++) {
+    pulsePerDeg[ch] = (servoLimit[ch].maxPulse - servoLimit[ch].minPulse) / 180.0;
+  }
+
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+}
+
+// ===================== LOOP =====================
+void loop() {
+  if (!homingDone) return;
+  BP32.update();
+  processControllers();
+}
